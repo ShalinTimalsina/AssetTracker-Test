@@ -13,7 +13,7 @@ A comprehensive web application for managing company assets, tracking assignment
 - Workflow
 - Project Structure
 - Contributing
-- License
+
 
 ## ✨ Features
 ### ✅ Core Functionality
@@ -190,5 +190,6 @@ npm start
     git push origin feature/amazing-feature
     ```
 5.  Open a Pull Request
+
 
 
