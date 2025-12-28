@@ -54,15 +54,16 @@ app.get('/api/health', (req, res) => {
 // POST /api/employees - Create employee
 app.post('/api/employees', checkDbConnection, async (req, res) => {
     try {
-        const { fullName, email } = req.body;
+        const { fullName, email, position } = req.body;
 
         const result = await pool.request()
             .input('fullName', sql.NVarChar, fullName)
             .input('email', sql.NVarChar, email)
+            .input('position', sql.NVarChar, position || null)
             .query(`
-        INSERT INTO Employees (FullName, Email)
-        OUTPUT INSERTED.EmployeeId, INSERTED.FullName, INSERTED.Email, INSERTED.CreatedAt
-        VALUES (@fullName, @email)
+        INSERT INTO Employees (FullName, Email, Position)
+        OUTPUT INSERTED.EmployeeId, INSERTED.FullName, INSERTED.Email, INSERTED.Position, INSERTED.CreatedAt
+        VALUES (@fullName, @email, @position)
       `);
 
         res.status(201).json({
@@ -92,28 +93,97 @@ app.get('/api/employees', checkDbConnection, async (req, res) => {
 // ASSETS
 // =====================================================
 
-// POST /api/assets - Create asset
+// Helper function to generate unique serial number from asset type
+async function generateSerialNumber(assetType) {
+    // Get first 2 letters of asset type (uppercase), handle short names
+    const prefix = assetType
+        .replace(/[^a-zA-Z]/g, '') // Remove non-letters
+        .substring(0, 2)
+        .toUpperCase()
+        .padEnd(2, 'X'); // Pad with X if less than 2 chars
+
+    const year = new Date().getFullYear();
+    const basePattern = `${prefix}-${year}-`;
+
+    // Find the highest existing number for this prefix-year combination
+    const result = await pool.request()
+        .input('pattern', sql.NVarChar, `${basePattern}%`)
+        .query(`
+            SELECT TOP 1 SerialNumber 
+            FROM Assets 
+            WHERE SerialNumber LIKE @pattern 
+            ORDER BY CAST(RIGHT(SerialNumber, 3) AS INT) DESC
+        `);
+
+    let nextNumber = 1;
+
+    if (result.recordset.length > 0) {
+        const lastSerial = result.recordset[0].SerialNumber;
+        const parts = lastSerial.split('-');
+        if (parts.length === 3) {
+            const lastNum = parseInt(parts[2], 10);
+            if (!isNaN(lastNum)) {
+                nextNumber = lastNum + 1;
+            }
+        }
+    }
+
+    // Format: XX-2025-001 (padded to 3 digits, can grow beyond 999)
+    const serialNumber = `${basePattern}${nextNumber.toString().padStart(3, '0')}`;
+
+    // Double-check uniqueness (security measure)
+    const existsCheck = await pool.request()
+        .input('serial', sql.NVarChar, serialNumber)
+        .query('SELECT COUNT(*) as cnt FROM Assets WHERE SerialNumber = @serial');
+
+    if (existsCheck.recordset[0].cnt > 0) {
+        // Extremely rare: collision detected, recursively try next number
+        return generateSerialNumber(assetType);
+    }
+
+    return serialNumber;
+}
+
+// POST /api/assets - Create asset with auto-generated serial number
 app.post('/api/assets', checkDbConnection, async (req, res) => {
     try {
-        const { assetName, assetType, serialNumber } = req.body;
+        const { assetName, assetType } = req.body;
+
+        if (!assetName || !assetType) {
+            return res.status(400).json({
+                success: false,
+                message: 'Asset name and type are required'
+            });
+        }
+
+        // Auto-generate unique serial number
+        const serialNumber = await generateSerialNumber(assetType);
 
         const result = await pool.request()
             .input('assetName', sql.NVarChar, assetName)
             .input('assetType', sql.NVarChar, assetType)
             .input('serialNumber', sql.NVarChar, serialNumber)
             .query(`
-        INSERT INTO Assets (AssetName, AssetType, SerialNumber)
-        OUTPUT INSERTED.*
-        VALUES (@assetName, @assetType, @serialNumber)
-      `);
+                INSERT INTO Assets (AssetName, AssetType, SerialNumber)
+                OUTPUT INSERTED.*
+                VALUES (@assetName, @assetType, @serialNumber)
+            `);
 
         res.status(201).json({
             success: true,
-            message: 'Asset created',
+            message: 'Asset created successfully',
             data: result.recordset[0]
         });
     } catch (err) {
         console.error('Create asset error:', err);
+
+        if (err.message.includes('UNIQUE') || err.message.includes('duplicate')) {
+            return res.status(400).json({
+                success: false,
+                message: 'Serial number conflict. Please try again.'
+            });
+        }
+
         res.status(400).json({ success: false, message: err.message });
     }
 });
@@ -164,6 +234,96 @@ app.get('/api/assets/:assetId/history', checkDbConnection, async (req, res) => {
     } catch (err) {
         console.error('Get asset history error:', err);
         res.status(500).json({ error: err.message });
+    }
+});
+
+// PUT /api/assets/:assetId - Update asset
+app.put('/api/assets/:assetId', checkDbConnection, async (req, res) => {
+    try {
+        const { assetId } = req.params;
+        const { assetName, assetType } = req.body;
+
+        if (!assetName || !assetType) {
+            return res.status(400).json({
+                success: false,
+                message: 'Asset name and type are required'
+            });
+        }
+
+        const result = await pool.request()
+            .input('assetId', sql.Int, assetId)
+            .input('assetName', sql.NVarChar, assetName)
+            .input('assetType', sql.NVarChar, assetType)
+            .query(`
+                UPDATE Assets 
+                SET AssetName = @assetName, AssetType = @assetType
+                OUTPUT INSERTED.*
+                WHERE AssetId = @assetId
+            `);
+
+        if (result.recordset.length === 0) {
+            return res.status(404).json({
+                success: false,
+                message: 'Asset not found'
+            });
+        }
+
+        res.json({
+            success: true,
+            message: 'Asset updated successfully',
+            data: result.recordset[0]
+        });
+    } catch (err) {
+        console.error('Update asset error:', err);
+        res.status(400).json({ success: false, message: err.message });
+    }
+});
+
+// DELETE /api/assets/:assetId - Delete asset (only if not currently assigned)
+app.delete('/api/assets/:assetId', checkDbConnection, async (req, res) => {
+    try {
+        const { assetId } = req.params;
+
+        // Check if asset is currently assigned
+        const assignmentCheck = await pool.request()
+            .input('assetId', sql.Int, assetId)
+            .query(`
+                SELECT COUNT(*) as cnt 
+                FROM AssetAssignments 
+                WHERE AssetId = @assetId AND ReturnedAt IS NULL
+            `);
+
+        if (assignmentCheck.recordset[0].cnt > 0) {
+            return res.status(400).json({
+                success: false,
+                message: 'Cannot delete asset. It is currently assigned to an employee. Return it first.'
+            });
+        }
+
+        // Delete assignment history first (if any)
+        await pool.request()
+            .input('assetId', sql.Int, assetId)
+            .query('DELETE FROM AssetAssignments WHERE AssetId = @assetId');
+
+        // Delete the asset
+        const result = await pool.request()
+            .input('assetId', sql.Int, assetId)
+            .query('DELETE FROM Assets WHERE AssetId = @assetId');
+
+        if (result.rowsAffected[0] === 0) {
+            return res.status(404).json({
+                success: false,
+                message: 'Asset not found'
+            });
+        }
+
+        res.json({
+            success: true,
+            message: 'Asset deleted successfully'
+        });
+    } catch (err) {
+        console.error('Delete asset error:', err);
+        res.status(400).json({ success: false, message: err.message });
     }
 });
 
@@ -237,16 +397,144 @@ app.post('/api/assignments/:assignmentId/return', checkDbConnection, async (req,
     }
 });
 
-// GET /api/assignments/active - Get active assignments (using stored procedure)
+// GET /api/assignments/active - Get active assignments with employee details
 app.get('/api/assignments/active', checkDbConnection, async (req, res) => {
     try {
+        // Use direct query to include all employee details
         const result = await pool.request()
-            .execute('sp_GetActiveAssignments');
+            .query(`
+                SELECT 
+                    aa.AssignmentId,
+                    aa.AssetId,
+                    aa.EmployeeId,
+                    aa.AssignedAt,
+                    aa.ReturnedAt,
+                    a.AssetName,
+                    a.AssetType,
+                    a.SerialNumber,
+                    e.FullName AS EmployeeName,
+                    e.Email AS EmployeeEmail,
+                    e.Position AS EmployeePosition
+                FROM AssetAssignments aa
+                JOIN Assets a ON aa.AssetId = a.AssetId
+                JOIN Employees e ON aa.EmployeeId = e.EmployeeId
+                WHERE aa.ReturnedAt IS NULL
+                ORDER BY aa.AssignedAt DESC
+            `);
 
         res.json(result.recordset);
     } catch (err) {
         console.error('Get active assignments error:', err);
         res.status(500).json({ error: err.message });
+    }
+});
+
+// =====================================================
+// ASSET TYPES (CRUD)
+// =====================================================
+
+// GET /api/asset-types - Get all unique asset types (from Assets table + defaults)
+app.get('/api/asset-types', checkDbConnection, async (req, res) => {
+    try {
+        const result = await pool.request()
+            .query(`
+                SELECT DISTINCT AssetType 
+                FROM Assets 
+                WHERE AssetType IS NOT NULL AND AssetType != ''
+                ORDER BY AssetType
+            `);
+
+        // Default types
+        const defaultTypes = ['Laptop', 'Mobile', 'Monitor', 'Keyboard', 'Mouse', 'Headset', 'Tablet', 'Camera', 'Printer', 'Other'];
+        const dbTypes = result.recordset.map(r => r.AssetType);
+
+        // Merge and deduplicate
+        const allTypes = [...new Set([...defaultTypes, ...dbTypes])].sort();
+
+        res.json(allTypes);
+    } catch (err) {
+        console.error('Get asset types error:', err);
+        res.status(500).json({ error: err.message });
+    }
+});
+
+// PUT /api/asset-types/rename - Rename an asset type (updates all assets with that type)
+app.put('/api/asset-types/rename', checkDbConnection, async (req, res) => {
+    try {
+        const { oldType, newType } = req.body;
+
+        if (!oldType || !newType) {
+            return res.status(400).json({
+                success: false,
+                message: 'Old type and new type are required'
+            });
+        }
+
+        if (oldType === newType) {
+            return res.status(400).json({
+                success: false,
+                message: 'New type must be different from old type'
+            });
+        }
+
+        // Check if new type already exists (to prevent duplicates)
+        const existsCheck = await pool.request()
+            .input('newType', sql.NVarChar, newType)
+            .query('SELECT COUNT(*) as cnt FROM Assets WHERE AssetType = @newType');
+
+        if (existsCheck.recordset[0].cnt > 0) {
+            return res.status(400).json({
+                success: false,
+                message: `Type "${newType}" already exists. Cannot create duplicate.`
+            });
+        }
+
+        // Update all assets with the old type
+        const result = await pool.request()
+            .input('oldType', sql.NVarChar, oldType)
+            .input('newType', sql.NVarChar, newType)
+            .query(`
+                UPDATE Assets 
+                SET AssetType = @newType 
+                WHERE AssetType = @oldType
+            `);
+
+        res.json({
+            success: true,
+            message: `Renamed "${oldType}" to "${newType}". ${result.rowsAffected[0]} asset(s) updated.`,
+            count: result.rowsAffected[0]
+        });
+    } catch (err) {
+        console.error('Rename asset type error:', err);
+        res.status(400).json({ success: false, message: err.message });
+    }
+});
+
+// DELETE /api/asset-types/:type - Delete a type (only if no assets use it)
+app.delete('/api/asset-types/:type', checkDbConnection, async (req, res) => {
+    try {
+        const { type } = req.params;
+
+        // Check if any assets use this type
+        const countCheck = await pool.request()
+            .input('type', sql.NVarChar, type)
+            .query('SELECT COUNT(*) as cnt FROM Assets WHERE AssetType = @type');
+
+        if (countCheck.recordset[0].cnt > 0) {
+            return res.status(400).json({
+                success: false,
+                message: `Cannot delete "${type}". ${countCheck.recordset[0].cnt} asset(s) are using this type. Rename or reassign them first.`
+            });
+        }
+
+        // Type is not in use, just return success (it's only in our default list)
+        res.json({
+            success: true,
+            message: `Type "${type}" is not used by any assets.`
+        });
+    } catch (err) {
+        console.error('Delete asset type error:', err);
+        res.status(400).json({ success: false, message: err.message });
     }
 });
 

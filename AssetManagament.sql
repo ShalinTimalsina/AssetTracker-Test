@@ -15,6 +15,8 @@ CREATE TABLE Employees (
     FullName NVARCHAR(100) NOT NULL,
     Email NVARCHAR(100) NOT NULL UNIQUE,
     CreatedAt DATETIME2 NOT NULL DEFAULT GETDATE()
+    ALTER TABLE Employees ADD Position NVARCHAR(100) NULL;
+    UPDATE Employees SET Position = 'Staff' WHERE Position IS NULL;
 );
 
 -- Creation of second table.
@@ -129,11 +131,37 @@ INSERT INTO Employees (FullName, Email) VALUES
 ('Sarah Johnson', 'sarah@company.com'),
 ('Mike Chen', 'mike@company.com');
 
+
+USE AssetTrackingDB;
+GO
+
+INSERT INTO Employees (FullName, Email) VALUES
+('Aarav Sharma', 'aarav.sharma@company.com'),
+('Sita Thapa', 'sita.thapa@company.com'),
+('Bikash Gurung', 'bikash.gurung@company.com'),
+('Priya Shrestha', 'priya.shrestha@company.com'),
+('Rajesh Adhikari', 'rajesh.adhikari@company.com'),
+('Anita Rai', 'anita.rai@company.com'),
+('Sunil Tamang', 'sunil.tamang@company.com'),
+('Kabita Magar', 'kabita.magar@company.com'),
+('Dipesh Bhandari', 'dipesh.bhandari@company.com'),
+('Manisha Karki', 'manisha.karki@company.com');
+GO
+
+-- Verify the data
+SELECT * FROM Employees;
+
+
+
+
 INSERT INTO Assets (AssetName, AssetType, SerialNumber) VALUES
 ('MacBook Pro 16"', 'Laptop', 'MBP-001'),
 ('iPhone 15 Pro', 'Phone', 'IPH-001'),
 ('Dell Monitor', 'Monitor', 'MON-001');
 GO
+
+
+
 
 
 
@@ -148,6 +176,8 @@ GO
 -- Switch to your database
 USE AssetTrackingDB;
 GO
+
+
 
 -- Create user for the login
 CREATE USER Finetuners FOR LOGIN Finetuners;
